@@ -1,98 +1,84 @@
-# zai-glm-cli (guizmo-ai/zai-glm-cli) 턴루프 정밀 분석
+# zai-glm-cli: 가장 단순한 턴 루프
 
-Ink 기반 TUI(TypeScript). superagent-ai/grok-cli를 포크해 Z.ai GLM 모델을 연결한 커뮤니티 구현체. "도구 유무로 반복하다 최종 응답" 수준의 **고전 루프 원형**으로, 현대 구현과의 격차를 보여주는 대조군.
+## 한 줄 요약
 
-> Z.ai(Zhipu) 공식 조직(zai-org)에는 공개 CLI 에이전트 레포가 없다. GLM Coding Plan은 Claude Code/Cline 등 기존 도구에 GLM 엔드포인트를 연결하는 구독 상품이라, "glm code"의 공개 구현체로는 이 레포가 가장 근접하다.
+모델이 도구를 요청하면 실행하고 다시 모델에게 묻는다. 도구 요청이 없으면 그 답을 최종 답으로 사용한다.
 
-## 0. 소스 맵 (file:line)
+## 비유로 이해하기
 
-| 역할 | 위치 |
-|---|---|
-| 턴루프(비스트리밍) | `src/agent/zai-agent.ts` — `processUserMessage`(≈430), `while(toolRounds<maxToolRounds)`(459) |
-| 턴루프(스트리밍) | `processUserMessageStreaming`(≈665), `while`(681) |
-| 도구 디스패치 | `executeTool`(935) — switch 문 |
-| 스트림 누적 | `src/agent/stream-processor.ts` — `StreamProcessor.process`, tool_calls 인덱싱(175) |
-| 확인 게이트 | `ConfirmationTool`(agent 필드 63/95, 도구 구현부 내장) |
-| 서브에이전트 | `src/agents/task-orchestrator.ts` — `TaskOrchestrator`(17), `executeParallel`(145) |
+요리사가 조리법을 한 단계씩 말하고, 조수가 그대로 실행한다고 생각하면 된다.
 
----
+- 요리사가 “양파를 썰어”라고 하면 조수가 실행한다.
+- 실행 결과를 알려 주면 요리사가 다음 단계를 말한다.
+- 요리사가 완성된 요리를 내놓으면 작업이 끝난다.
 
-## 1~2. 루프 구성물
-
-`maxToolRounds`(기본 400)가 유일한 상한. 반복 간 이월 상태는 `this.messages`(대화 히스토리)와 `this.chatHistory`(UI용 ChatEntry)뿐 — 상태 구조체·전이 타입이 없다.
-
-### 비스트리밍 (`processUserMessage:430`)
-```
-messages.push(user); newEntries=[userEntry]; toolRounds=0
-response = zaiClient.chat(messages, tools)
-while toolRounds < maxToolRounds:                      (459)
-   msg = response.choices[0].message
-   if msg.tool_calls:
-      toolRounds++
-      assistant(tool_calls) 메시지 push
-      for toolCall in msg.tool_calls:                  ← 순차
-         result = executeTool(toolCall)
-         role:"tool" 결과 메시지 push
-      response = zaiClient.chat(messages, tools)        ← 재샘플링
-   else:
-      최종 assistant push; break
-if toolRounds >= maxToolRounds: "최대 라운드 도달" 경고
-```
-
-### 스트리밍 (`processUserMessageStreaming:665`)
-동일 골격 + **상태 머신**(`createChatStateMachine`): `thinking → planning_tools → executing_tools`. `StreamProcessor.process(stream)`가 델타를 누적해 `finishReason==="tool_calls" && toolCalls.length>0`을 판정(stream-processor.ts:139). 각 반복·각 도구 전에 `abortController.signal.aborted` 검사 → 취소 시 `[Operation cancelled]` 후 `done`. 도구는 **순차** 실행(758~).
-
----
-
-## 3~6. 샘플링·도구·게이트
-
-- **샘플링**: `zaiClient.chat`(일괄) 또는 `chatStream`(스트리밍). 스트리밍은 `StreamProcessor`가 `tool_calls`를 index 기준으로 누적(175~195, 델타 병합).
-- **도구 실행**: `executeTool`(935)는 큰 `switch`로 `view_file/create_file/str_replace_editor/edit_file/bash/search/batch_edit/…`를 각 도구 인스턴스에 직접 위임. **루프 레벨 권한 게이트가 없다.**
-- **확인 게이트**: 파일 조작(create_file, str_replace_editor)과 bash만 **도구 구현부에 내장된 `ConfirmationTool`**로 실행 전 사용자 확인(시스템 프롬프트 199~200에 명시). "세션 동안 승인" 옵션 존재. 거부 처리는 시스템 프롬프트로 모델에 위임("거부되면 대안을 제시하라", 294). `executeTool` switch 자체엔 확인 로직이 없어, 게이트가 도구 안쪽에 흩어져 있다.
-
-| 게이트 | 유무 |
-|---|---|
-| 사용자 확인 | 있음(파일/bash, 도구 내장) |
-| 라운드 상한 | 있음(`maxToolRounds=400`) — 유일한 폭주 방어 |
-| 취소 | 있음(`abortController`, 반복·도구 전 검사) |
-| 훅 | **없음**(`src/hooks/`는 React UI 훅뿐) |
-| 컴팩션 | **없음**(토큰 카운터로 집계만, 초과는 API 에러) |
-| 미들웨어 | **없음** |
-
----
-
-## 7~10. 종료·자가턴·스티어링·서브에이전트
-
-- **종료**: `msg.tool_calls`가 없으면 최종 응답 push 후 `break`. 루프 종료 = 턴 종료.
-- **자가 턴**: **없음.** Stop 훅/goal/next-speaker/nudge/token-budget 류 재진입 장치가 전무.
-- **스티어링/메시지 큐**: **없음.** 턴 실행 중 입력은 처리되지 않고, 개입은 프로세스 수준 abort뿐.
-- **서브에이전트**: `TaskOrchestrator`(task-orchestrator.ts:17, EventEmitter)가 코드리뷰·테스트·문서화 등 특화 에이전트를 관리. `executeParallel`(145)은 `Promise.all`로 병렬(maxConcurrency 설정 가능, 286), `executeSequential`(164)도 제공. 각 서브에이전트는 독립 히스토리로 실행되고 결과가 부모 히스토리에 합쳐짐 — 부모와의 상호작용은 단순 await(전용 큐/메일박스/status 채널 없음).
-
----
-
-## 11~12. 이벤트 / 동시성
-
-"이벤트"는 UI 렌더링용 `ChatEntry` 갱신 + 제너레이터 yield(`content/tool_calls/tool_result/done/token_count/thinking`)뿐. 동시성은 `abortController` 하나로 프로세스 수준 취소만. 도구는 순차 실행이라 도구 간 병렬성 없음(서브에이전트만 TaskOrchestrator로 병렬).
-
----
-
-## 요약 — 진화 스펙트럼의 원점
-
-턴루프 발전 단계의 베이스라인이다: 게이트는 사용자 확인 1종(도구 내장), 이벤트는 UI ChatEntry 갱신뿐이며, 훅·미들웨어·메시지 큐·컴팩션·자가 턴·스티어링이 **모두 없다**. codex/openclaude 급 구현과 비교하면 "루프 사이에 개입 계층(훅·미들웨어·큐·메일박스·압축)을 얼마나 체계적으로 끼워 넣었는가"가 현대 에이전트 복잡도의 본질임을 역으로 드러낸다.
-
----
-
-## 루프 구조 다이어그램
+## 전체 흐름
 
 ```mermaid
 flowchart TD
-    Start(["processUserMessage"]) --> Chat["zaiClient.chat"]
-    Chat --> Loop{{"while rounds 가 maxToolRounds(400) 미만"}}
-    Loop --> HasTool{"tool_calls?"}
-    HasTool -->|"yes"| Exec["executeTool (순차) · 파일/bash는 ConfirmationTool"]
-    Exec --> Rechat["재샘플링 zaiClient.chat"] --> Loop
-    HasTool -->|"no"| End(["최종 응답 → break"])
-    Loop -. "rounds 초과" .-> Warn(["경고 후 종료"])
+    Start(["사용자 요청"]) --> Model["모델에게 묻기"]
+    Model --> Decision{"도구 요청이 있는가?"}
+    Decision -->|"예"| Confirm{"파일 수정·명령 실행인가?"}
+    Confirm -->|"확인 필요"| User["사용자에게 승인 요청"]
+    User -->|"승인"| Run["도구를 순서대로 실행"]
+    User -->|"거부"| Result["거부 결과 기록"]
+    Confirm -->|"바로 실행 가능"| Run
+    Run --> Result["도구 결과 기록"]
+    Result --> Count{"도구 반복 한도 미만인가?"}
+    Count -->|"예"| Model
+    Count -->|"아니요"| Warn(["경고 후 종료"])
+    Decision -->|"아니요"| Done(["최종 답변"])
 ```
 
-> 훅·미들웨어·메시지 큐·컴팩션·자가 턴·스티어링이 모두 없는 최소 루프 — 위 다이어그램이 전부다.
+## 단계별로 보기
+
+1. 사용자 메시지를 대화 기록에 넣는다.
+2. 대화 기록과 사용할 수 있는 도구 목록을 모델에 보낸다.
+3. 모델이 도구를 요청하면 하나씩 실행한다.
+4. 실행 결과를 대화 기록에 넣고 다시 모델에 보낸다.
+5. 모델이 도구 없이 답하면 턴을 끝낸다.
+
+스트리밍 모드도 원리는 같다. 다만 글이 만들어지는 동안 화면에 조금씩 보여 주고, 도구 요청 조각을 모아 완성된 요청으로 만든다.
+
+## 안전장치
+
+| 장치 | 동작 |
+|---|---|
+| 사용자 확인 | 파일 변경과 셸 명령은 도구 내부에서 확인할 수 있다. |
+| 반복 한도 | 도구를 최대 400라운드까지 실행한다. |
+| 취소 | 각 반복과 도구 실행 전에 취소 신호를 확인한다. |
+
+다른 에이전트와 달리 별도의 종료 훅, 자동 대화 압축, 턴 도중 새 지시 받기는 제공하지 않는다. 그래서 구조는 이해하기 쉽지만 복잡한 장기 작업을 제어하는 기능은 적다.
+
+## 서브에이전트
+
+`TaskOrchestrator`는 여러 전문 에이전트를 순서대로 또는 동시에 실행할 수 있다. 부모는 자식이 끝날 때까지 기다린 뒤 결과를 합친다. 별도 메일박스나 상태 채널은 없다.
+
+```mermaid
+flowchart LR
+    Parent["부모 에이전트"] --> Split["작업 나누기"]
+    Split --> A["코드 검토"]
+    Split --> B["테스트"]
+    Split --> C["문서 작성"]
+    A --> Join["결과 모으기"]
+    B --> Join
+    C --> Join
+    Join --> Parent
+```
+
+## 이 구현에서 배울 점
+
+- 턴 루프의 최소 형태를 가장 분명하게 보여 준다.
+- “도구 요청이 있으면 반복, 없으면 종료”가 기본 뼈대다.
+- 고급 기능은 결국 이 뼈대의 앞뒤에 검사와 메시지 통로를 추가한 것이다.
+
+## 기술 참고
+
+| 역할 | 소스 |
+|---|---|
+| 일반 응답 루프 | `src/agent/zai-agent.ts`의 `processUserMessage` |
+| 스트리밍 응답 루프 | `src/agent/zai-agent.ts`의 `processUserMessageStreaming` |
+| 도구 분배 | `src/agent/zai-agent.ts`의 `executeTool` |
+| 스트림에서 도구 요청 조립 | `src/agent/stream-processor.ts`의 `StreamProcessor.process` |
+| 사용자 확인 | `ConfirmationTool` |
+| 서브에이전트 실행 | `src/agents/task-orchestrator.ts`의 `TaskOrchestrator` |

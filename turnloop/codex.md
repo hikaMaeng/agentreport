@@ -1,182 +1,141 @@
-# codex (openai/codex) 턴루프 정밀 분석
+# Codex: 접수와 작업이 분리된 턴 루프
 
-Rust(tokio) 기반. 이벤트 소싱(`EventMsg` 스트림) + 요청-응답형 게이트(`Op`)로 완전 비동기화되어 TUI·앱서버·SDK가 같은 코어를 공유한다.
+## 한 줄 요약
 
-## 0. 소스 맵 (file:line)
+바깥쪽은 새 요청과 승인 응답을 계속 받고, 안쪽은 한 요청을 해결할 때까지 모델 호출과 도구 실행을 반복한다.
 
-| 역할 | 위치 |
-|---|---|
-| 세션 수명 루프 | `codex-rs/core/src/session/handlers.rs` — `submission_loop`(710) |
-| 턴루프 본체 | `codex-rs/core/src/session/turn.rs` — `run_turn`(144), `run_sampling_request`(1123), `try_run_sampling_request`(1948) |
-| 턴 스폰 | `codex-rs/core/src/tasks/mod.rs` — `spawn_task`(314)/`start_task`(325) |
-| 입력 큐(steer+mailbox) | `codex-rs/core/src/session/input_queue.rs` |
-| 승인 게이트 | `codex-rs/core/src/session/mod.rs` — `request_command_approval`(2168)/`request_patch_approval`(2247)/`notify_approval`(2742) |
-| steer 진입 | `codex-rs/core/src/session/mod.rs` — `steer_input`(3856) |
-| 훅 이벤트 정의 | `codex-rs/protocol/src/protocol.rs` — `HookEventName`(1494) |
-| 훅 런타임 | `codex-rs/core/src/hook_runtime.rs` — `run_turn_stop_hooks`(298) |
-| 서브에이전트 대기 | `codex-rs/core/src/tools/handlers/multi_agents/wait.rs` — `handle_call`(52) |
+## 비유로 이해하기
 
----
+식당으로 보면 이해하기 쉽다.
 
-## 1~2. 이중 루프 구조
+- **카운터**는 새 주문, 주문 변경, 결제 승인을 계속 받는다.
+- **주방**은 주문 하나를 완성할 때까지 조리와 확인을 반복한다.
+- 주방이 위험한 작업의 승인을 기다리는 동안에도 카운터는 답을 받을 수 있다.
 
-### submission_loop — 세션 수명 (`handlers.rs:710`)
-클라이언트가 보내는 `Submission { id, op }`를 채널(`rx_sub.recv()`)에서 받아 디스패치하는 무한 루프. `Op::Shutdown`으로만 탈출. 관건은 **턴루프의 게이트 응답이 여기로 들어온다**는 점:
-- `Op::UserInput` → `user_input_or_turn`: 활성 턴이 없으면 새 턴 스폰, 있으면 steer 주입.
-- `Op::ExecApproval{id,decision}` / `Op::PatchApproval{id,decision}` → `notify_approval`(2742): **승인 대기 중인 oneshot을 깨움**.
-- `Op::UserInputAnswer`, `Op::RequestPermissionsResponse`, `Op::DynamicToolResponse`, `Op::ResolveElicitation` → 기타 요청-응답 게이트 해제.
-- `Op::Interrupt`(활성 턴 abort), `Op::Compact`, `Op::ThreadRollback`, `Op::RefreshMcpServers`, `Op::InterAgentCommunication`(에이전트 간 mailbox 유입) 등.
+이 분리 덕분에 긴 명령이 실행 중이어도 사용자가 취소하거나, 승인하거나, 지시를 덧붙일 수 있다.
 
-### run_turn — 턴 1건 (`turn.rs:144`)
-`spawn_task`(`tasks/mod.rs:314`)로 스폰. `spawn_task`는 먼저 `abort_all_tasks(Replaced)`로 기존 턴을 밀어내고(→ 새 UserInput은 항상 기존 턴을 대체), `start_task`가 `CancellationToken`+`Notify(done)`를 만들고 pending input을 turn_state로 옮긴 뒤 turn span 아래에서 `run_turn`을 실행한다. Task는 `TaskKind`(Regular/Review/Compact)로 구분되며 이 종류가 steer 가능 여부를 결정한다(§9).
-
-`run_turn` 골격:
-```
-run_turn(input):
-  1. run_pre_sampling_compact — 이전 모델 comp_hash 변경/작은 컨텍스트 전환/토큰한도 시 PreTurn 압축
-  2. build_skills_and_plugins — /skill·plugin·connector 멘션 해석 → injection item
-  3. run_pending_session_start_hooks — block 시 턴 포기
-  4. run_hooks_and_record_inputs(input) — UserPromptSubmit류 훅으로 입력 검사·기록
-  5. loop {                                              ← 샘플링 루프 (227)
-       pending = get_pending_input(steer+mailbox) → 훅 검사 후 기록  (can_drain 플래그로 첫 턴/압축직후 지연)
-       maybe_record_reminder / maybe_record_current_time_reminder
-       step_context 캡처(도구목록·컨텍스트를 요청 단위 고정)
-       run_sampling_request(...)                        ← 스트리밍+도구 (재시도 루프 내장)
-       판정:
-         needs_follow_up = 모델이 도구호출 or pending input 존재
-         should_roll_over(토큰한도+follow_up) → MidTurn 자동압축 후 continue  (354)
-         needs_follow_up → continue
-         !needs_follow_up →
-            run_turn_stop_hooks(stop_hook_active, last_msg)   ← Stop 훅  (380)
-              should_block & 프롬프트有 → 훅 프롬프트 히스토리 기록, mailbox 수락, stop_hook_active=true, continue  (자가 턴)
-              should_stop → break
-            run_legacy_after_agent_hook → break
-       에러: TurnAborted 전파 / InvalidImage 이미지 치환 후 continue / 그외 에러 이벤트 후 break
-     }
-```
-
----
-
-## 3~4. 반복당 컨텍스트·샘플링
-
-`run_sampling_request`(1123)는 재시도 루프로, 매 시도에서 히스토리를 `for_prompt(input_modalities)`로 렌더해 `build_prompt`(1095: input+tool specs+parallel_tool_calls+base_instructions+output_schema)를 만들고 `try_run_sampling_request`를 호출. 재시도는 `handle_retryable_response_stream_error`(백오프)로, `ContextWindowExceeded`/`UsageLimitReached`는 즉시 상위로.
-
-`try_run_sampling_request`(1948)가 실제 스트림 소비 루프:
-```
-stream = client_session.stream(prompt, model_info, ...)     ← or_cancel(cancellation_token)
-in_flight: FuturesOrdered<...ResponseInputItem>             ← 도구 호출 병렬 실행 큐
-loop stream.next():
-  Created / OutputItemDone(item) / 델타류(AgentMessageContentDelta, ReasoningContentDelta, PlanDelta …)
-  도구 호출 item → ToolCallRuntime로 실행 future를 in_flight에 push
-  Completed → needs_follow_up·last_agent_message 확정, break
-```
-스트리밍 델타가 `EventMsg`(AgentMessageContentDelta/ReasoningContentDelta/TurnDiff 등)로 클라이언트에 흐른다. Plan 모드는 `PlanModeStreamState`로 assistant 메시지 start를 비-plan 텍스트가 나올 때까지 지연.
-
----
-
-## 5~6. 도구 실행과 게이트
-
-도구는 스트림 루프 내부에서 `ToolCallRuntime`(병렬 지원)로 실행되고, exec/patch류 도구는 실행 전 승인 게이트를 호출한다.
-
-**승인 게이트 = oneshot 요청/응답** (`mod.rs:2168`):
-```
-request_command_approval(...):
-  (tx_approve, rx_approve) = oneshot::channel()
-  turn_state.insert_pending_approval(approval_id, tx_approve)      ← 대기 맵에 등록
-  send_event(ExecApprovalRequest{ available_decisions, parsed_cmd, network_ctx, ... })
-  return rx_approve.await.unwrap_or(Abort)                          ← 여기서 블로킹
-```
-클라이언트가 결정하면 `Op::ExecApproval` → submission_loop → `notify_approval(approval_id, decision)`가 맵에서 tx를 꺼내 send → 대기가 풀린다. `request_patch_approval`(2247)도 동일 패턴(`ApplyPatchApprovalRequest`). `ReviewDecision` = Approved/ApprovedForSession/Denied/Abort. 드롭 시 기본 Abort로 안전.
-
-**게이트 정리:**
-| 게이트 | 기전 |
-|---|---|
-| approval policy | 위 oneshot. `default_available_decisions`가 네트워크/execpolicy amendment/추가권한에 따라 선택지 구성 |
-| 샌드박스 | seatbelt/landlock/bwrap + 네트워크 승인(`NetworkApprovalContext`, allow/deny amendment) |
-| 훅 | 11종: `PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop, Stop`. 핸들러 command/prompt/agent, 실행 sync/async |
-| 컨텍스트 | PreTurn/MidTurn 자동압축. 로컬 요약·리모트(v1/v2)·토큰버짓 3경로(`run_auto_compact`, turn.rs:965) |
-| Guardian | 별도 리뷰 세션이 위험 작업 검토. guardian 소스 턴은 스킬/플러그인 주입 차단 |
-
----
-
-## 7~8. 종료와 자가 턴
-
-종료는 `needs_follow_up==false`일 때만 판정(378). `run_turn_stop_hooks`(`hook_runtime.rs:298`)가 `StopHookOutcome{should_block, should_stop, continuation_fragments}`를 돌려주고:
-- `should_block` + 프롬프트 조각 有 → `build_hook_prompt_message`로 user-visible 메시지 생성해 히스토리 기록 → `accept_mailbox_delivery_for_current_turn` → `stop_hook_active=true` → `continue` (**자가 턴 발생**). `stop_hook_active`가 다음 훅 호출에 전달되어 훅이 무한 재진입을 스스로 판단(codex `/goal`류의 기반).
-- 프롬프트 없이 block → 경고 이벤트 후 무시.
-- `should_stop` → break. 아니면 legacy AfterAgent 훅 후 break.
-
-폭주 방어: 압축이 임계 밑으로 못 내리면 무한이 이론상 가능하지만 "압축이 잘 되면 문제없다"는 주석(353). 에러는 대부분 break로 종료.
-
----
-
-## 9. 스티어링 / 메시지 큐 — 2계층 (`input_queue.rs`)
-
-`InputQueue`는 **Steer**와 **Mailbox** 두 활동을 `InputQueueActivity`로 구분한다.
-
-- **Steer**(사용자가 턴 중 보낸 입력): `steer_input`(`mod.rs:3856`)이 활성 턴·turn_id 검증 후, TaskKind가 Regular일 때만 허용(Review/Compact는 `ActiveTurnNotSteerable`). `additional_context`를 merge하고 `TurnInput::UserInput`을 만들어 `extend_pending_input_and_accept_mailbox_delivery_for_turn_state`로 turn_state.pending_input에 넣고 activity=Steer 브로드캐스트. 루프 상단 `get_pending_input`이 drain해 다음 샘플링 전 히스토리로. 단 **턴 시작 직후·자동압축 직후엔 drain 지연**(`can_drain_pending_input` 플래그, turn.rs:191/374) — 새 턴 입력·모델 continuation이 먼저 샘플링돼야 하므로.
-- **Mailbox**(에이전트 간 통신 `InterAgentCommunication`): `enqueue_mailbox_communication`으로 `VecDeque`에 적재. `MailboxDeliveryPhase` 상태 기계가 "이번 턴 수락 vs 다음 턴 연기"를 제어(`accepts_mailbox_delivery_for_current_turn`). `trigger_turn` 플래그 메일은 새 턴을 발생. 모델이 follow-up 필요한 시점(`accept_mailbox_delivery_for_current_turn`)에만 현재 턴에 배달을 허용해, 자식 결과가 부모 턴 임의 시점에 끼어드는 것을 차단.
-
-`get_pending_input`(204)은 active-turn 락 아래 pending_input을 split_off하고, mailbox 수락 상태면 `drain_mailbox_input_items`를 이어 붙인다(원자성 유지).
-
----
-
-## 10. 에이전트 간 통신·서브에이전트 대기 — 블로킹 wait
-
-codex의 서브에이전트 대기는 openclaude와 정반대로 **턴을 도구 호출에 블로킹**한다.
-
-`spawn_agent`/`wait_agent`/multi_agents 도구군. `wait_agent`(`wait.rs:52`):
-```
-targets = 대기할 자식 thread id들
-각 id에 subscribe_status → watch::Receiver<AgentStatus>
-초기 이미 final이면 즉시 수집, 아니면:
-  FuturesUnordered { wait_for_final_status(session,id,rx) }        ← 각 자식 상태변화 구독
-  deadline = now + timeout_ms.clamp(MIN,MAX)
-  loop timeout_at(deadline, futures.next()):
-    최초 final 하나 수집 후 break, 나머지는 now_or_never로 즉시 수집분만
-timed_out = 수집 0건
-CollabAgentToolCall 아이템 InProgress→Completed로 emit, WaitAgentResult{status, timed_out} 반환
-```
-즉 부모의 **턴이 wait_agent 도구 호출 안에서 status watch 채널을 블로킹 대기**한다(deadline 있음). 자식의 결과·메시지는 mailbox(`InterAgentCommunication`)를 통해 부모 InputQueue로 유입되고(§9), `SubagentStart`/`SubagentStop` 훅이 발화한다. codex_delegate.rs는 자식의 `ExecApprovalRequest`를 부모 세션의 `request_command_approval`로 위임해 승인을 부모가 처리한다(권한 상속).
-
----
-
-## 11~12. 이벤트 / 동시성
-
-`EventMsg` 스트림: 델타류, `ExecApprovalRequest`/`ApplyPatchApprovalRequest`, `TurnDiff`, `PlanDelta`, `CollabAgentToolCall`, `SubAgentActivity`, `Warning`, `Error`, turn 라이프사이클 등. 취소는 `CancellationToken`(턴별, child_token으로 하위 전파)을 `or_cancel`로 모든 await에 겹쳐, abort 시 `CodexErr::TurnAborted`가 루프를 빠져나온다. `Op::Interrupt`가 `abort_all_tasks`를 호출.
-
----
-
-## 요약
-
-- 게이트가 전부 **이벤트 emit + oneshot/watch 대기 + Op 응답**으로 비동기화 → 승인·서브에이전트 대기가 명시적 요청/응답 채널.
-- 컴팩션이 진입 전/샘플링 사이/모델 전환 3시점에서 트리거되는 가장 정교한 구현.
-- Stop 훅 continuation이 `/goal`류 자가 턴의 기반. `stop_hook_active`로 재진입을 훅이 판단.
-- 스티어링은 Steer/Mailbox 2계층 + `MailboxDeliveryPhase` 상태 기계. 서브에이전트 대기는 **블로킹 wait_agent**(watch 채널+deadline)로, openclaude의 폴+attachment 모델과 대조.
-
----
-
-## 루프 구조 다이어그램
+## 전체 흐름
 
 ```mermaid
 flowchart TD
-    Sub["submission_loop (세션 수명)"] -->|"Op::UserInput"| Spawn["spawn_task → run_turn"]
-    Sub -. "Op::ExecApproval" .-> Notify["notify_approval (oneshot 해제)"]
-    Spawn --> Pre["pre-sampling 압축"]
-    Pre --> SStart["SessionStart 훅"]
-    SStart --> UInput["UserPromptSubmit 훅 + 입력기록"]
-    UInput --> Loop{{"샘플링 루프 loop"}}
-    Loop --> Drain["pending drain (steer + mailbox)"]
-    Drain --> Sample["run_sampling_request: 스트리밍 + 도구실행"]
-    Sample -. "exec/patch" .-> Approve["승인 게이트: ExecApprovalRequest → rx.await"]
-    Approve -.-> Notify
-    Sample --> Judge{"needs_follow_up?"}
-    Judge -->|"토큰한도"| Compact["MidTurn 자동압축"] --> Loop
-    Judge -->|"yes"| Loop
-    Judge -->|"no"| Stop["run_turn_stop_hooks"]
-    Stop -->|"block + 프롬프트"| Inject["continuation 주입 (stop_hook_active=true)"] --> Loop
-    Stop -->|"stop"| End(["턴 종료"])
+    subgraph Reception["바깥 루프: 요청 접수"]
+        Input["새 사용자 입력"]
+        Approval["승인·거부 응답"]
+        Cancel["취소 요청"]
+    end
 
-    Wait["wait_agent 도구"] -. "status watch 채널 + deadline (블로킹)" .-> Sample
-    Child[("자식 스레드")] -. "InterAgentCommunication → mailbox" .-> Drain
+    Input --> Start["작업 루프 시작"]
+    Start --> Prepare["대화 기록·규칙·스킬 준비"]
+    Prepare --> Model["모델에게 다음 행동 묻기"]
+    Model --> Tool{"도구 요청이 있는가?"}
+    Tool -->|"예"| Gate{"승인이 필요한가?"}
+    Gate -->|"예"| Wait["사용자 응답 대기"]
+    Approval -.-> Wait
+    Wait --> Run["도구 실행"]
+    Gate -->|"아니요"| Run
+    Run --> Record["결과 기록"] --> Prepare
+    Tool -->|"아니요"| StopHook{"종료 검사"}
+    StopHook -->|"더 해야 함"| Continue["계속할 이유를 메시지로 추가"] --> Prepare
+    StopHook -->|"완료"| Done(["최종 답변"])
+    Cancel -.-> Done
 ```
+
+## 두 개의 루프
+
+### 1. 바깥 루프: 접수 담당
+
+세션이 살아 있는 동안 계속 실행된다. 다음과 같은 신호를 받는다.
+
+- 새 사용자 요청
+- 명령 실행 또는 파일 수정 승인
+- 질문에 대한 사용자 답변
+- 작업 취소
+- 다른 에이전트가 보낸 메시지
+
+새 요청이 들어왔을 때 작업이 없다면 새 턴을 시작한다. 이미 일반 작업이 진행 중이면 새 입력을 현재 턴에 추가할 수 있다.
+
+### 2. 안쪽 루프: 실제 작업 담당
+
+한 요청을 처리한다.
+
+1. 필요한 경우 긴 대화를 요약한다.
+2. 스킬, 플러그인, 현재 시간 같은 보조 정보를 준비한다.
+3. 턴 시작 훅과 사용자 입력 훅을 실행한다.
+4. 모델을 호출한다.
+5. 도구 요청이 있으면 실행 결과를 기록하고 반복한다.
+6. 도구 요청이 없으면 종료 훅을 확인한다.
+7. 종료 훅이 “아직 끝나지 않았다”고 판단하면 이유를 추가하고 반복한다.
+
+## 도구 승인은 어떻게 기다릴까?
+
+작업 루프는 승인 요청마다 일회용 응답 통로를 만든다. 바깥 루프가 사용자의 승인 또는 거부를 받으면 같은 통로로 답을 보내고, 기다리던 도구가 실행을 재개한다.
+
+```mermaid
+sequenceDiagram
+    participant T as 작업 루프
+    participant U as 사용자 화면
+    participant S as 접수 루프
+    T->>U: 명령을 실행해도 될까요?
+    T->>T: 응답 대기
+    U->>S: 승인
+    S->>T: 승인 결과 전달
+    T->>T: 명령 실행 재개
+```
+
+응답 통로가 사라지거나 세션이 닫히면 안전하게 거부된 것으로 처리한다.
+
+## 턴 도중 새 지시
+
+Codex는 두 종류의 입력을 한 큐에서 구분한다.
+
+- **사용자 스티어링**: “그 파일 말고 다른 파일을 봐”처럼 진행 중에 들어온 새 지시
+- **에이전트 메일**: 자식 또는 동료 에이전트가 보낸 결과
+
+이 입력들은 아무 때나 모델 대화에 끼어들지 않는다. 현재 모델 호출이 끝나는 안전한 경계에서 꺼내 다음 모델 호출에 포함한다. 대화 압축 직후처럼 순서를 지켜야 하는 시점에는 잠시 미룬다.
+
+## 왜 모델이 답했는데도 계속할까?
+
+모델이 도구 없이 답했다고 항상 끝나는 것은 아니다. 종료 훅이 목표 달성 여부를 검사할 수 있다.
+
+- 통과하면 턴을 끝낸다.
+- 실패 이유와 계속할 내용을 주면 그 내용을 새 메시지로 기록하고 다시 모델을 호출한다.
+- 같은 종료 훅이 끝없이 자신을 호출하지 않도록 재진입 상태를 함께 관리한다.
+
+## 긴 대화 처리
+
+모델을 부르기 전이나, 작업 도중 토큰이 부족해질 때 대화를 요약한다. 요약 뒤에도 도구 결과와 새 입력의 순서가 깨지지 않도록 입력 큐를 잠시 멈췄다가 안전한 시점에 다시 연다.
+
+## 서브에이전트
+
+Codex는 자식 에이전트를 시작한 뒤 `wait_agent`로 상태 변화를 기다릴 수 있다. 기다림에는 마감 시간이 있으며, 완료된 자식이 생기면 결과를 모아 반환한다. 자식이 보내는 별도 메시지는 부모의 입력 큐로 들어온다.
+
+```mermaid
+flowchart LR
+    Parent["부모 에이전트"] --> Spawn["자식 시작"]
+    Spawn --> Child["자식 작업"]
+    Parent --> Wait["상태 채널에서 대기"]
+    Child --> Status["진행·완료 상태"]
+    Status --> Wait
+    Child -. "결과 메시지" .-> Mail["부모 입력 큐"]
+    Wait --> Parent
+    Mail --> Parent
+```
+
+## 이 구현에서 배울 점
+
+- 요청 접수와 실제 작업을 분리하면 승인, 취소, 중간 지시를 자연스럽게 처리할 수 있다.
+- 새 입력은 즉시 끼워 넣기보다 안전한 경계에서 반영해야 대화 순서가 보존된다.
+- 자동 계속 기능에는 반드시 재진입 방지와 종료 조건이 필요하다.
+
+## 기술 참고
+
+| 역할 | 소스 |
+|---|---|
+| 세션 접수 루프 | `codex-rs/core/src/session/handlers.rs`의 `submission_loop` |
+| 턴 작업 루프 | `codex-rs/core/src/session/turn.rs`의 `run_turn` |
+| 모델 호출과 스트림 처리 | 같은 파일의 `run_sampling_request`, `try_run_sampling_request` |
+| 작업 시작 | `codex-rs/core/src/tasks/mod.rs`의 `spawn_task`, `start_task` |
+| 입력 큐 | `codex-rs/core/src/session/input_queue.rs` |
+| 승인 요청·응답 | `codex-rs/core/src/session/mod.rs`의 `request_command_approval`, `request_patch_approval`, `notify_approval` |
+| 종료 훅 | `codex-rs/core/src/hook_runtime.rs`의 `run_turn_stop_hooks` |
+| 자식 대기 | `codex-rs/core/src/tools/handlers/multi_agents/wait.rs` |
