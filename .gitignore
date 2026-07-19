@@ -1,0 +1,19 @@
+# 클론한 참조 레포지토리는 추적하지 않는다.
+# 재구성 방법은 reference/README.md 참조.
+reference/*
+!reference/README.md
+
+# 일반
+node_modules/
+dist/
+build/
+target/
+.venv/
+__pycache__/
+*.pyc
+
+# 에디터/OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
