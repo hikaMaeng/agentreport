@@ -8,15 +8,15 @@
 
 | 폴더 | 내용 |
 |---|---|
-| **[trunloop/](trunloop/README.md)** | 턴루프 분석. 사용자 입력 1건이 들어와 최종 응답으로 끝날 때까지의 제어 흐름 — 게이트·훅·스티어링·자가 턴·에이전트 간 대기를 12개 축으로 정리 |
+| **[turnloop/](turnloop/README.md)** | 턴루프 분석. 사용자 입력 1건이 들어와 최종 응답으로 끝날 때까지의 제어 흐름 — 게이트·훅·스티어링·자가 턴·에이전트 간 대기를 12개 축으로 정리 |
 | **[tools/](tools/README.md)** | 내장 도구 분석. 각 에이전트가 모델에 어떤 도구를 어떻게 노출하는가 |
 | **[tools/categories.md](tools/categories.md)** | 도구를 12개 카테고리로 묶고 **각 카테고리가 턴루프의 어느 지점에서 어떻게 작동하는지** 교차 분석 |
 | **[reference/](reference/README.md)** | 분석 대상 레포 재구성 가이드 (클론 자체는 git에 미포함) |
 
 ## 읽는 순서
 
-1. [trunloop/README.md](trunloop/README.md) — 6개 구현의 턴루프 비교표와 공통 골격 다이어그램
-2. 관심 있는 에이전트의 개별 문서 (예: [trunloop/codex.md](trunloop/codex.md))
+1. [turnloop/README.md](turnloop/README.md) — 6개 구현의 턴루프 비교표와 공통 골격 다이어그램
+2. 관심 있는 에이전트의 개별 문서 (예: [turnloop/codex.md](turnloop/codex.md))
 3. [tools/categories.md](tools/categories.md) — 도구와 루프의 관계를 5유형으로 분류
 
 ## 핵심 관점
